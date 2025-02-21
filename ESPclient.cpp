@@ -36,7 +36,20 @@ const i2s_pin_config_t i2sOutPins = { // MAX98357功放
 };
 
 WiFiClient tcpClient;
-bool isPlaying = false;
+// bool isPlaying = false;
+
+enum SystemState {
+  STATE_IDLE,        // 空闲等待唤醒
+  STATE_RECORDING,   // 正在录音
+  STATE_PLAYING      // 正在播放
+};
+SystemState currentState = STATE_IDLE;
+
+unsigned long silenceStart = 0;
+const int SILENCE_TIMEOUT = 1500; // 1.5 秒静音停止
+
+unsigned long lastDataTransferTime = 0;
+bool dataTransferred = false;
 
 void setup() {
   Serial.begin(115200);
@@ -53,38 +66,34 @@ void setup() {
   
   // 连接服务器
   connectServer();
+  
+  lastDataTransferTime = millis();
 }
-
-static unsigned long lastActionTime = millis();
 
 void loop() {
-    static bool isRecording = true;
-    
-    if (!tcpClient.connected()) {
-        reconnect();
-        lastActionTime = millis();
-    }
+  if (!tcpClient.connected()) {
+    reconnect();
+    return;
+  }
 
-    if (millis() - lastActionTime > 30000) { // 30秒超时
-        Serial.println("系统超时，重置状态");
-        reconnect();
-        lastActionTime = millis();
-        return;
-    }
-
-    if (isRecording) {
-        recordAndSend();
-        isRecording = false;
-        setLedColor(CRGB::Blue); // 进入接收状态
-    } else {
-        if (receiveAndPlay()) {   // 如果成功播放完成
-            isRecording = true;
-            setLedColor(CRGB::Green); // 回到录音状态
-        }
-    }
-
-    handleLED();
+  switch(currentState){
+    case STATE_IDLE:
+      checkWakeWord();
+      break;
+      
+    case STATE_RECORDING:
+      recordAndSend();
+      break;
+      
+    case STATE_PLAYING:
+      receiveAndPlay();
+      currentState = STATE_IDLE; // 播放完成后回到空闲
+      break;
+  }
+  
+  handleLED();
 }
+
 
 // 初始化I2S子系统
 void initI2S() {
@@ -117,84 +126,87 @@ void initI2S() {
   i2s_set_pin(I2S_NUM_1, &i2sOutPins);
 }
 
-// 录音并发送
+// 合并后的录音和发送函数
+// 合并后的录音和发送函数
 void recordAndSend() {
   const size_t chunkSize = 1024;
   int16_t buffer[chunkSize];
-  size_t totalSent = 0;
-  
-  Serial.println("开始录音...");
-  unsigned long start = millis();
-  
-  while(millis() - start < RECORD_TIME * 1000) {
+  unsigned long startTime = millis();
+
+  while((millis() - startTime) < RECORD_TIME*1000){
     size_t bytesRead;
-    i2s_read(I2S_NUM_0, (char*)buffer, sizeof(buffer), &bytesRead, portMAX_DELAY);
-    
-    if(bytesRead > 0) {
-      // 发送数据包
-      uint16_t packetSize = bytesRead;
+    if(i2s_read(I2S_NUM_0, buffer, sizeof(buffer), &bytesRead, 0) == ESP_OK){
+      sendAudioChunk(buffer, bytesRead);
       
-      // 发送包头
-      if(tcpClient.write((uint8_t*)&packetSize, sizeof(packetSize)) != sizeof(packetSize)) {
-        Serial.println("包头发送失败");
-        break;
+      // VAD检测
+      if(isSilence(buffer, bytesRead/2)){
+        if(silenceStart == 0) silenceStart = millis();
+        else if(millis()-silenceStart > SILENCE_TIMEOUT) break;
+      } else {
+        silenceStart = 0;
       }
-      
-      // 发送音频数据
-      size_t sent = tcpClient.write((uint8_t*)buffer, bytesRead);
-      if(sent != bytesRead) {
-        Serial.println("数据发送不完整");
-        break;
-      }
-      
-      totalSent += sent;
-      Serial.printf("已发送 %d 字节\n", totalSent);
     }
   }
-  
+
   // 发送结束标志
   uint16_t endFlag = 0xFFFF;
-  tcpClient.write((uint8_t*)&endFlag, sizeof(endFlag));
-  Serial.printf("总计发送 %d 字节\n", totalSent);
-  
-  // 等待确认
-  unsigned long ackWaitStart = millis();
-  while(tcpClient.available() < 2 && millis() - ackWaitStart < 3000) {
-    delay(10);
+  size_t sent = tcpClient.write((uint8_t*)&endFlag, sizeof(endFlag));
+  Serial.printf("已发送结束标志，发送字节数：%d\n", sent);
+  if (sent != sizeof(endFlag)) {
+      Serial.println("发送结束标志失败");
+      // 可以添加重试逻辑
+  } else {
+     // 等待服务器确认消息
+      currentState = STATE_PLAYING;
+      unsigned long confirmStartTime = millis();
+      // while (millis() - confirmStartTime < 30000) { // 等待 5 秒
+      //     if (tcpClient.available() > 0) {
+      //         String response = tcpClient.readStringUntil('\n');
+      //         if (response == "DATA_RECEIVED") {
+      //             currentState = STATE_PLAYING;
+      //             Serial.println("开始接收回复");
+      //             break;
+      //         }
+      //     }
+      }
+      if (currentState != STATE_PLAYING) {
+          Serial.println("未收到服务器确认消息，保持当前状态");
+      }
   }
-  
-  if(tcpClient.available() >= 2) {
-    uint16_t ack;
-    tcpClient.readBytes((uint8_t*)&ack, 2);
-    if(ack == 0xAAAA) {
-      Serial.println("收到服务端确认");
-    }
-  }
-}
+// }
 
 // 接收并播放音频
-bool receiveAndPlay() {
-    const size_t headerSize = sizeof(uint16_t);
-    uint16_t expectedSize = 0;
-    bool playbackComplete = false;
-    
-    while(tcpClient.available() >= headerSize) {
-        tcpClient.readBytes((uint8_t*)&expectedSize, headerSize);
-        
-        if(expectedSize == 0xFFFF) { 
-            playbackComplete = true;
-            break;
-        }
-        
-        int16_t audioBuffer[expectedSize];
-        size_t received = tcpClient.readBytes((uint8_t*)audioBuffer, expectedSize);
-        
-        if(received == expectedSize) {
-            size_t written;
-            i2s_write(I2S_NUM_1, (const char*)audioBuffer, received, &written, portMAX_DELAY);
-        }
+void receiveAndPlay() {
+  const size_t headerSize = 2;
+  uint16_t packetSize = 0;
+  int16_t audioBuffer[1024];
+
+  while(true){
+    // 等待包头
+    while(tcpClient.available() < headerSize){
+      delay(1);
+      if(!tcpClient.connected()) return;
     }
-    return playbackComplete;
+    
+    // 读取包头
+    tcpClient.readBytes((uint8_t*)&packetSize, headerSize);
+    
+    // 结束标志
+    if(packetSize == 0xFFFF) break;
+    
+    // 读取音频数据
+    size_t received = 0;
+    while(received < packetSize){
+      size_t toRead = min(sizeof(audioBuffer), packetSize - received);
+      size_t actualRead = tcpClient.readBytes((uint8_t*)audioBuffer, toRead);
+      
+      // 实时播放
+      size_t written;
+      i2s_write(I2S_NUM_1, audioBuffer, actualRead, &written, portMAX_DELAY);
+      received += actualRead;
+    }
+  }
+  Serial.println("播放完成");
 }
 
 // 网络连接管理
@@ -241,19 +253,23 @@ void connectServer() {
   Serial.println("服务器连接成功！");
 }
 
+
 void reconnect() {
   setLedColor(CRGB::Purple);
   Serial.println("连接丢失，尝试重新连接...");
   
   tcpClient.stop();
+  WiFi.disconnect();
+  delay(1000);
   connectWiFi();
   connectServer();
+  currentState = STATE_IDLE; // 重置状态
 }
 
 // LED状态指示
 void handleLED() {
   static uint8_t hue = 0;
-  if(isPlaying){
+  if(currentState == STATE_PLAYING){
     // 播放时蓝色呼吸灯
     leds[0] = CHSV(hue++, 100, beatsin8(20, 50, 255));
   } else {
@@ -267,4 +283,54 @@ void handleLED() {
 void setLedColor(CRGB color) {
   fill_solid(leds, NUM_LEDS, color);
   FastLED.show();
+}
+
+void checkWakeWord() {
+  static int16_t buffer[512];
+  size_t bytesRead;
+  
+  if(i2s_read(I2S_NUM_0, buffer, sizeof(buffer), &bytesRead, 0) == ESP_OK){
+    // 实时发送原始音频流
+    sendAudioChunk(buffer, bytesRead);
+    
+    // 检查服务器响应
+    if(tcpClient.available() > 0){
+      String response = tcpClient.readStringUntil('\n');
+      if(response == "WAKE_CONFIRMED"){
+        currentState = STATE_RECORDING;
+        silenceStart = 0;
+        Serial.println("进入录音状态");
+      }
+    }
+  }
+}
+
+bool isSilence(int16_t* samples, size_t count) {
+  const int16_t SILENCE_THRESHOLD = 500; // 静音阈值
+  for (int i=0; i<count; i++) {
+    if (abs(samples[i]) > SILENCE_THRESHOLD) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void sendAudioChunk(void* data, size_t bytes) {
+    const size_t MAX_PACKET_SIZE = 4096; // 限制最大数据包大小为 4096 字节
+    if (bytes > MAX_PACKET_SIZE) {
+        // 分割数据并分多次发送
+        size_t offset = 0;
+        while (offset < bytes) {
+            size_t chunkSize = std::min(MAX_PACKET_SIZE, bytes - offset);
+            uint16_t header = chunkSize;
+            tcpClient.write((uint8_t*)&header, sizeof(header));
+            tcpClient.write((uint8_t*)((uint8_t*)data + offset), chunkSize);
+            offset += chunkSize;
+        }
+    } else {
+        uint16_t header = bytes;
+        tcpClient.write((uint8_t*)&header, sizeof(header));
+        tcpClient.write((uint8_t*)data, bytes);
+    }
+    delay(10);
 }
