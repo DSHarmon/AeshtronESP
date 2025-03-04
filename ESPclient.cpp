@@ -46,31 +46,26 @@ enum SystemState {
 SystemState currentState = STATE_IDLE;
 
 unsigned long silenceStart = 0;
-const int SILENCE_TIMEOUT = 1500; // 1.5 秒静音停止
+const int SILENCE_TIMEOUT = 500; // 1.5 秒静音停止
 
 unsigned long lastDataTransferTime = 0;
 bool dataTransferred = false;
 
 void setup() {
   Serial.begin(115200);
-  
-  // 初始化LED
+
   FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
-  setLedColor(CRGB::Red); // 启动时红色
-  
-  // 初始化I2S
+  setLedColor(CRGB::Red);
+
   initI2S();
-  
-  // 连接WiFi
   connectWiFi();
-  
-  // 连接服务器
   connectServer();
-  
+
   lastDataTransferTime = millis();
 }
 
 void loop() {
+
   if (!tcpClient.connected()) {
     reconnect();
     return;
@@ -87,7 +82,7 @@ void loop() {
       
     case STATE_PLAYING:
       receiveAndPlay();
-      currentState = STATE_IDLE; // 播放完成后回到空闲
+ // 播放完成后回到空闲
       break;
   }
   
@@ -137,7 +132,6 @@ void recordAndSend() {
     size_t bytesRead;
     if(i2s_read(I2S_NUM_0, buffer, sizeof(buffer), &bytesRead, 0) == ESP_OK){
       sendAudioChunk(buffer, bytesRead);
-      
       // VAD检测
       if(isSilence(buffer, bytesRead/2)){
         if(silenceStart == 0) silenceStart = millis();
@@ -147,7 +141,6 @@ void recordAndSend() {
       }
     }
   }
-
   // 发送结束标志
   uint16_t endFlag = 0xFFFF;
   size_t sent = tcpClient.write((uint8_t*)&endFlag, sizeof(endFlag));
@@ -157,58 +150,94 @@ void recordAndSend() {
       // 可以添加重试逻辑
   } else {
      // 等待服务器确认消息
-      currentState = STATE_PLAYING;
       unsigned long confirmStartTime = millis();
-      // while (millis() - confirmStartTime < 30000) { // 等待 5 秒
-      //     if (tcpClient.available() > 0) {
-      //         String response = tcpClient.readStringUntil('\n');
-      //         if (response == "DATA_RECEIVED") {
-      //             currentState = STATE_PLAYING;
-      //             Serial.println("开始接收回复");
-      //             break;
-      //         }
-      //     }
+      while (millis() - confirmStartTime < 30000) { // 等待 5 秒
+          if (tcpClient.available() > 0) {
+              String response = tcpClient.readStringUntil('\n');
+              if (response == "DATA_RECEIVED") {
+                  currentState = STATE_PLAYING;
+                  Serial.println("开始接收回复");
+                  break;
+              }
+          }
       }
       if (currentState != STATE_PLAYING) {
           Serial.println("未收到服务器确认消息，保持当前状态");
       }
   }
-// }
+}
 
 // 接收并播放音频
 void receiveAndPlay() {
   const size_t headerSize = 2;
   uint16_t packetSize = 0;
-  int16_t audioBuffer[1024];
+  int16_t audioBuffer[2048];
 
-  while(true){
+  while (true) {
     // 等待包头
-    while(tcpClient.available() < headerSize){
+    while (tcpClient.available() < headerSize) {
       delay(1);
-      if(!tcpClient.connected()) return;
+      if (!tcpClient.connected()) {
+        Serial.println("网络连接断开，停止播放");
+        return;
+      }
     }
-    
+
     // 读取包头
     tcpClient.readBytes((uint8_t*)&packetSize, headerSize);
-    
+
     // 结束标志
-    if(packetSize == 0xFFFF) break;
-    
+    if (packetSize == 0xFFFF) {
+      break;
+    }
+
     // 读取音频数据
     size_t received = 0;
-    while(received < packetSize){
+    while (received < packetSize) {
+      if (!tcpClient.connected()) {
+        Serial.println("网络连接断开，停止播放");
+        return;
+      }
       size_t toRead = min(sizeof(audioBuffer), packetSize - received);
       size_t actualRead = tcpClient.readBytes((uint8_t*)audioBuffer, toRead);
-      
+      if (actualRead == 0) {
+        // 没有读取到数据，可能网络有问题，等待一段时间后重试
+        delay(10);
+        continue;
+      }
+
       // 实时播放
       size_t written;
       i2s_write(I2S_NUM_1, audioBuffer, actualRead, &written, portMAX_DELAY);
       received += actualRead;
     }
   }
-  Serial.println("播放完成");
-}
 
+  Serial.println("播放完成");
+
+  // 停止 I2S 输出，清空 DMA 缓冲区并等待传输完成
+  i2s_zero_dma_buffer(I2S_NUM_1);
+  vTaskDelay(pdMS_TO_TICKS(100));
+
+  // 卸载 I2S 驱动
+  i2s_driver_uninstall(I2S_NUM_1);
+
+  // 重新初始化 I2S 输出配置
+  i2s_config_t i2sOutConfig = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 1024
+  };
+  i2s_driver_install(I2S_NUM_1, &i2sOutConfig, 0, NULL);
+  i2s_set_pin(I2S_NUM_1, &i2sOutPins);
+
+  currentState = STATE_IDLE;
+}
 // 网络连接管理
 void connectWiFi() {
   if(WiFi.status() == WL_CONNECTED) return;
@@ -290,9 +319,7 @@ void checkWakeWord() {
   size_t bytesRead;
   
   if(i2s_read(I2S_NUM_0, buffer, sizeof(buffer), &bytesRead, 0) == ESP_OK){
-    // 实时发送原始音频流
     sendAudioChunk(buffer, bytesRead);
-    
     // 检查服务器响应
     if(tcpClient.available() > 0){
       String response = tcpClient.readStringUntil('\n');
